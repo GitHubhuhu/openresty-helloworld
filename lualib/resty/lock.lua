@@ -5,17 +5,17 @@ local ffi = require "ffi"
 local ffi_new = ffi.new
 local shared = ngx.shared
 local sleep = ngx.sleep
-local shdict_mt
+local log = ngx.log
+local max = math.max
+local min = math.min
 local debug = ngx.config.debug
 local setmetatable = setmetatable
-local getmetatable = getmetatable
 local tonumber = tonumber
 
-
-local _M = { _VERSION = '0.04' }
+local _M = { _VERSION = '0.07' }
 local mt = { __index = _M }
 
-
+local ERR = ngx.ERR
 local FREE_LIST_REF = 0
 
 -- FIXME: we don't need this when we have __gc metamethod support on Lua
@@ -65,7 +65,7 @@ local function gc_lock(cdata)
         -- print("dict.delete type: ", type(dict.delete))
         local ok, err = dict:delete(key)
         if not ok then
-            ngx.log(ngx.ERR, 'failed to delete key "', key, '": ', err)
+            log(ERR, 'failed to delete key "', key, '": ', err)
         end
         cdata.key_id = 0
     end
@@ -100,8 +100,12 @@ function _M.new(_, dict_name, opts)
         exptime = 30
     end
 
-    if timeout and timeout > exptime then
-        timeout = exptime
+    if timeout then
+        timeout = min(timeout, exptime)
+
+        if step then
+            step = min(step, timeout)
+        end
     end
 
     local self = {
@@ -131,9 +135,7 @@ function _M.lock(self, key)
     local ok, err = dict:add(key, true, exptime)
     if ok then
         cdata.key_id = ref_obj(key)
-        if not shdict_mt then
-            shdict_mt = getmetatable(dict)
-        end
+        self.key = key
         return 0
     end
     if err ~= "exists" then
@@ -146,10 +148,6 @@ function _M.lock(self, key)
     local max_step = self.max_step
     local elapsed = 0
     while timeout > 0 do
-        if step > timeout then
-            step = timeout
-        end
-
         sleep(step)
         elapsed = elapsed + step
         timeout = timeout - step
@@ -157,9 +155,7 @@ function _M.lock(self, key)
         local ok, err = dict:add(key, true, exptime)
         if ok then
             cdata.key_id = ref_obj(key)
-            if not shdict_mt then
-                shdict_mt = getmetatable(dict)
-            end
+            self.key = key
             return elapsed
         end
 
@@ -171,13 +167,7 @@ function _M.lock(self, key)
             break
         end
 
-        step = step * ratio
-        if step <= 0 then
-            step = 0.001
-        end
-        if step > max_step then
-            step = max_step
-        end
+        step = min(max(0.001, step * ratio), timeout, max_step)
     end
 
     return nil, "timeout"
@@ -202,6 +192,27 @@ function _M.unlock(self)
     cdata.key_id = 0
 
     return 1
+end
+
+
+function _M.expire(self, time)
+    local dict = self.dict
+    local cdata = self.cdata
+    local key_id = tonumber(cdata.key_id)
+    if key_id <= 0 then
+        return nil, "unlocked"
+    end
+
+    if not time then
+        time = self.exptime
+    end
+
+    local ok, err =  dict:replace(self.key, true, time)
+    if not ok then
+        return nil, err
+    end
+
+    return true
 end
 
 

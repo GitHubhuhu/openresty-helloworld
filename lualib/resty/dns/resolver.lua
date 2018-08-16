@@ -21,11 +21,10 @@ local re_sub = ngx.re.sub
 local tcp = ngx.socket.tcp
 local log = ngx.log
 local DEBUG = ngx.DEBUG
-local randomseed = math.randomseed
-local ngx_time = ngx.time
 local unpack = unpack
 local setmetatable = setmetatable
 local type = type
+local ipairs = ipairs
 
 
 local ok, new_tab = pcall(require, "table.new")
@@ -43,6 +42,7 @@ local IP6_ARPA = "ip6.arpa"
 local TYPE_A      = 1
 local TYPE_NS     = 2
 local TYPE_CNAME  = 5
+local TYPE_SOA    = 6
 local TYPE_PTR    = 12
 local TYPE_MX     = 15
 local TYPE_TXT    = 16
@@ -52,12 +52,17 @@ local TYPE_SPF    = 99
 
 local CLASS_IN    = 1
 
+local SECTION_AN  = 1
+local SECTION_NS  = 2
+local SECTION_AR  = 3
+
 
 local _M = {
-    _VERSION    = '0.14',
+    _VERSION    = '0.21',
     TYPE_A      = TYPE_A,
     TYPE_NS     = TYPE_NS,
     TYPE_CNAME  = TYPE_CNAME,
+    TYPE_SOA    = TYPE_SOA,
     TYPE_PTR    = TYPE_PTR,
     TYPE_MX     = TYPE_MX,
     TYPE_TXT    = TYPE_TXT,
@@ -65,6 +70,9 @@ local _M = {
     TYPE_SRV    = TYPE_SRV,
     TYPE_SPF    = TYPE_SPF,
     CLASS_IN    = CLASS_IN,
+    SECTION_AN  = SECTION_AN,
+    SECTION_NS  = SECTION_NS,
+    SECTION_AR  = SECTION_AR
 }
 
 
@@ -76,6 +84,7 @@ local resolver_errstrs = {
     "refused",          -- 5
 }
 
+local soa_int32_fields = { "serial", "refresh", "retry", "expire", "minimum" }
 
 local mt = { __index = _M }
 
@@ -285,7 +294,7 @@ local function _build_request(qname, id, no_recurse, opts)
     local nan = "\0\0"
     local nns = "\0\0"
     local nar = "\0\0"
-    local typ = "\0" .. char(qtype)
+    local typ = char(rshift(qtype, 8), band(qtype, 0xff))
     local class = "\0\1"    -- the Internet class
 
     if byte(qname, 1) == DOT_CHAR then
@@ -301,108 +310,19 @@ local function _build_request(qname, id, no_recurse, opts)
 end
 
 
-local function parse_response(buf, id)
-    local n = #buf
-    if n < 12 then
-        return nil, 'truncated';
-    end
+local function parse_section(answers, section, buf, start_pos, size,
+                             should_skip)
+    local pos = start_pos
 
-    -- header layout: ident flags nqs nan nns nar
-
-    local ident_hi = byte(buf, 1)
-    local ident_lo = byte(buf, 2)
-    local ans_id = lshift(ident_hi, 8) + ident_lo
-
-    -- print("id: ", id, ", ans id: ", ans_id)
-
-    if ans_id ~= id then
-        -- identifier mismatch and throw it away
-        log(DEBUG, "id mismatch in the DNS reply: ", ans_id, " ~= ", id)
-        return nil, "id mismatch"
-    end
-
-    local flags_hi = byte(buf, 3)
-    local flags_lo = byte(buf, 4)
-    local flags = lshift(flags_hi, 8) + flags_lo
-
-    -- print(format("flags: 0x%x", flags))
-
-    if band(flags, 0x8000) == 0 then
-        return nil, format("bad QR flag in the DNS response")
-    end
-
-    if band(flags, 0x200) ~= 0 then
-        return nil, "truncated"
-    end
-
-    local code = band(flags, 0x7f)
-
-    -- print(format("code: %d", code))
-
-    local nqs_hi = byte(buf, 5)
-    local nqs_lo = byte(buf, 6)
-    local nqs = lshift(nqs_hi, 8) + nqs_lo
-
-    -- print("nqs: ", nqs)
-
-    if nqs ~= 1 then
-        return nil, format("bad number of questions in DNS response: %d", nqs)
-    end
-
-    local nan_hi = byte(buf, 7)
-    local nan_lo = byte(buf, 8)
-    local nan = lshift(nan_hi, 8) + nan_lo
-
-    -- print("nan: ", nan)
-
-    -- skip the question part
-
-    local ans_qname, pos = _decode_name(buf, 13)
-    if not ans_qname then
-        return nil, pos
-    end
-
-    -- print("qname in reply: ", ans_qname)
-
-    -- print("question: ", sub(buf, 13, pos))
-
-    if pos + 3 + nan * 12 > n then
-        -- print(format("%d > %d", pos + 3 + nan * 12, n))
-        return nil, 'truncated';
-    end
-
-    -- question section layout: qname qtype(2) qclass(2)
-
-    local type_hi = byte(buf, pos)
-    local type_lo = byte(buf, pos + 1)
-    local ans_type = lshift(type_hi, 8) + type_lo
-
-    -- print("ans qtype: ", ans_type)
-
-    local class_hi = byte(buf, pos + 2)
-    local class_lo = byte(buf, pos + 3)
-    local qclass = lshift(class_hi, 8) + class_lo
-
-    -- print("ans qclass: ", qclass)
-
-    if qclass ~= 1 then
-        return nil, format("unknown query class %d in DNS response", qclass)
-    end
-
-    pos = pos + 4
-
-    local answers = {}
-
-    if code ~= 0 then
-        answers.errcode = code
-        answers.errstr = resolver_errstrs[code] or "unknown"
-    end
-
-    for i = 1, nan do
+    for _ = 1, size do
         -- print(format("ans %d: qtype:%d qclass:%d", i, qtype, qclass))
-
         local ans = {}
-        insert(answers, ans)
+
+        if not should_skip then
+            insert(answers, ans)
+        end
+
+        ans.section = section
 
         local name
         name, pos = _decode_name(buf, pos)
@@ -414,28 +334,26 @@ local function parse_response(buf, id)
 
         -- print("name: ", name)
 
-        type_hi = byte(buf, pos)
-        type_lo = byte(buf, pos + 1)
+        local type_hi = byte(buf, pos)
+        local type_lo = byte(buf, pos + 1)
         local typ = lshift(type_hi, 8) + type_lo
 
         ans.type = typ
 
         -- print("type: ", typ)
 
-        class_hi = byte(buf, pos + 2)
-        class_lo = byte(buf, pos + 3)
+        local class_hi = byte(buf, pos + 2)
+        local class_lo = byte(buf, pos + 3)
         local class = lshift(class_hi, 8) + class_lo
 
         ans.class = class
 
         -- print("class: ", class)
 
-        local ttl_bytes = { byte(buf, pos + 4, pos + 7) }
+        local byte_1, byte_2, byte_3, byte_4 = byte(buf, pos + 4, pos + 7)
 
-        -- print("ttl bytes: ", concat(ttl_bytes, " "))
-
-        local ttl = lshift(ttl_bytes[1], 24) + lshift(ttl_bytes[2], 16)
-                    + lshift(ttl_bytes[3], 8) + ttl_bytes[4]
+        local ttl = lshift(byte_1, 24) + lshift(byte_2, 16)
+                    + lshift(byte_3, 8) + byte_4
 
         -- print("ttl: ", ttl)
 
@@ -489,7 +407,6 @@ local function parse_response(buf, id)
 
             local addr_bytes = { byte(buf, pos, pos + 15) }
             local flds = {}
-            local comp_begin, comp_end
             for i = 1, 16, 2 do
                 local a = addr_bytes[i]
                 local b = addr_bytes[i + 1]
@@ -642,12 +559,185 @@ local function parse_response(buf, id)
 
             ans.ptrdname = name
 
+        elseif typ == TYPE_SOA then
+            local name, p = _decode_name(buf, pos)
+            if not name then
+                return nil, pos
+            end
+            ans.mname = name
+
+            pos = p
+            name, p = _decode_name(buf, pos)
+            if not name then
+                return nil, pos
+            end
+            ans.rname = name
+
+            for _, field in ipairs(soa_int32_fields) do
+                local byte_1, byte_2, byte_3, byte_4 = byte(buf, p, p + 3)
+                ans[field] = lshift(byte_1, 24) + lshift(byte_2, 16)
+                            + lshift(byte_3, 8) + byte_4
+                p = p + 4
+            end
+
+            pos = p
+
         else
             -- for unknown types, just forward the raw value
 
             ans.rdata = sub(buf, pos, pos + len - 1)
             pos = pos + len
         end
+    end
+
+    return pos
+end
+
+
+local function parse_response(buf, id, opts)
+    local n = #buf
+    if n < 12 then
+        return nil, 'truncated';
+    end
+
+    -- header layout: ident flags nqs nan nns nar
+
+    local ident_hi = byte(buf, 1)
+    local ident_lo = byte(buf, 2)
+    local ans_id = lshift(ident_hi, 8) + ident_lo
+
+    -- print("id: ", id, ", ans id: ", ans_id)
+
+    if ans_id ~= id then
+        -- identifier mismatch and throw it away
+        log(DEBUG, "id mismatch in the DNS reply: ", ans_id, " ~= ", id)
+        return nil, "id mismatch"
+    end
+
+    local flags_hi = byte(buf, 3)
+    local flags_lo = byte(buf, 4)
+    local flags = lshift(flags_hi, 8) + flags_lo
+
+    -- print(format("flags: 0x%x", flags))
+
+    if band(flags, 0x8000) == 0 then
+        return nil, format("bad QR flag in the DNS response")
+    end
+
+    if band(flags, 0x200) ~= 0 then
+        return nil, "truncated"
+    end
+
+    local code = band(flags, 0xf)
+
+    -- print(format("code: %d", code))
+
+    local nqs_hi = byte(buf, 5)
+    local nqs_lo = byte(buf, 6)
+    local nqs = lshift(nqs_hi, 8) + nqs_lo
+
+    -- print("nqs: ", nqs)
+
+    if nqs ~= 1 then
+        return nil, format("bad number of questions in DNS response: %d", nqs)
+    end
+
+    local nan_hi = byte(buf, 7)
+    local nan_lo = byte(buf, 8)
+    local nan = lshift(nan_hi, 8) + nan_lo
+
+    -- print("nan: ", nan)
+
+    local nns_hi = byte(buf, 9)
+    local nns_lo = byte(buf, 10)
+    local nns = lshift(nns_hi, 8) + nns_lo
+
+    local nar_hi = byte(buf, 11)
+    local nar_lo = byte(buf, 12)
+    local nar = lshift(nar_hi, 8) + nar_lo
+
+    -- skip the question part
+
+    local ans_qname, pos = _decode_name(buf, 13)
+    if not ans_qname then
+        return nil, pos
+    end
+
+    -- print("qname in reply: ", ans_qname)
+
+    -- print("question: ", sub(buf, 13, pos))
+
+    if pos + 3 + nan * 12 > n then
+        -- print(format("%d > %d", pos + 3 + nan * 12, n))
+        return nil, 'truncated';
+    end
+
+    -- question section layout: qname qtype(2) qclass(2)
+
+    --[[
+    local type_hi = byte(buf, pos)
+    local type_lo = byte(buf, pos + 1)
+    local ans_type = lshift(type_hi, 8) + type_lo
+    ]]
+
+    -- print("ans qtype: ", ans_type)
+
+    local class_hi = byte(buf, pos + 2)
+    local class_lo = byte(buf, pos + 3)
+    local qclass = lshift(class_hi, 8) + class_lo
+
+    -- print("ans qclass: ", qclass)
+
+    if qclass ~= 1 then
+        return nil, format("unknown query class %d in DNS response", qclass)
+    end
+
+    pos = pos + 4
+
+    local answers = {}
+
+    if code ~= 0 then
+        answers.errcode = code
+        answers.errstr = resolver_errstrs[code] or "unknown"
+    end
+
+    local authority_section, additional_section
+
+    if opts then
+        authority_section = opts.authority_section
+        additional_section = opts.additional_section
+        if opts.qtype == TYPE_SOA then
+            authority_section = true
+        end
+    end
+
+    local err
+
+    pos, err = parse_section(answers, SECTION_AN, buf, pos, nan)
+
+    if not pos then
+        return nil, err
+    end
+
+    if not authority_section and not additional_section then
+        return answers
+    end
+
+    pos, err = parse_section(answers, SECTION_NS, buf, pos, nns,
+                             not authority_section)
+
+    if not pos then
+        return nil, err
+    end
+
+    if not additional_section then
+        return answers
+    end
+
+    pos, err = parse_section(answers, SECTION_AR, buf, pos, nar)
+
+    if not pos then
+        return nil, err
     end
 
     return answers
@@ -663,7 +753,7 @@ local function _gen_id(self)
 end
 
 
-local function _tcp_query(self, query, id)
+local function _tcp_query(self, query, id, opts)
     local sock = self.tcp_sock
     if not sock then
         return nil, "not initialized"
@@ -697,9 +787,9 @@ local function _tcp_query(self, query, id)
             .. concat(server, ":") .. ": " .. err
     end
 
-    local len_hi = byte(buf, 1)
-    local len_lo = byte(buf, 2)
-    local len = lshift(len_hi, 8) + len_lo
+    len_hi = byte(buf, 1)
+    len_lo = byte(buf, 2)
+    len = lshift(len_hi, 8) + len_lo
 
     -- print("tcp message len: ", len)
 
@@ -709,7 +799,7 @@ local function _tcp_query(self, query, id)
             .. concat(server, ":") .. ": " .. err
     end
 
-    local answers, err = parse_response(buf, id)
+    local answers, err = parse_response(buf, id, opts)
     if not answers then
         return nil, "failed to parse the reply from the TCP server "
             .. concat(server, ":") .. ": " .. err
@@ -736,11 +826,11 @@ function _M.tcp_query(self, qname, opts)
         return nil, err
     end
 
-    return _tcp_query(self, query, id)
+    return _tcp_query(self, query, id, opts)
 end
 
 
-function _M.query(self, qname, opts)
+function _M.query(self, qname, opts, tries)
     local socks = self.socks
     if not socks then
         return nil, "not initialized"
@@ -757,55 +847,60 @@ function _M.query(self, qname, opts)
     -- print("query: ", cjson.encode(concat(query, "")))
 
     local retrans = self.retrans
+    if tries then
+        tries[1] = nil
+    end
 
     -- print("retrans: ", retrans)
 
     for i = 1, retrans do
         local sock = pick_sock(self, socks)
 
-        local ok, err = sock:send(query)
+        local ok
+        ok, err = sock:send(query)
         if not ok then
             local server = _get_cur_server(self)
-            return nil, "failed to send request to UDP server "
+            err = "failed to send request to UDP server "
                 .. concat(server, ":") .. ": " .. err
-        end
 
-        local buf, err
+        else
+            local buf
 
-        for j = 1, 128 do
-            buf, err = sock:receive(4096)
-
-            if err then
-                break
-            end
-
-            if buf then
-                local answers
-                answers, err = parse_response(buf, id)
-                if not answers then
-                    if err == "truncated" then
-                        return _tcp_query(self, query, id)
-                    end
-
-                    if err ~= "id mismatch" then
-                        return nil, err
-                    end
-
-                    -- retry receiving when err == "id mismatch"
-                else
-                    return answers
+            for _ = 1, 128 do
+                buf, err = sock:receive(4096)
+                if err then
+                    local server = _get_cur_server(self)
+                    err = "failed to receive reply from UDP server "
+                        .. concat(server, ":") .. ": " .. err
+                    break
                 end
+
+                if buf then
+                    local answers
+                    answers, err = parse_response(buf, id, opts)
+                    if err == "truncated" then
+                        answers, err = _tcp_query(self, query, id, opts)
+                    end
+
+                    if err and err ~= "id mismatch" then
+                        break
+                    end
+
+                    if answers then
+                        return answers, nil, tries
+                    end
+                end
+                -- only here in case of an "id mismatch"
             end
         end
 
-        if err ~= "timeout" or i == retrans then
-            local server = _get_cur_server(self)
-            return nil, "failed to receive reply from UDP server "
-                .. concat(server, ":") .. ": " .. err
+        if tries then
+            tries[i] = err
+            tries[i + 1] = nil -- ensure termination for user supplied table
         end
     end
 
-    -- impossible to reach here
+    return nil, err, tries
 end
 
 
@@ -855,7 +950,7 @@ function _M.arpa_str(addr)
         for i = addrlen, 0, -1 do
             local s = byte(addr, i)
             if s == COLON_CHAR or not s then
-                for j = hidx, 4 do
+                for _ = hidx, 4 do
                     arpa_tmpl[idx] = ZERO_CHAR
                     idx = idx + 2
                 end
@@ -881,9 +976,6 @@ function _M.reverse_query(self, addr)
     return self.query(self, self.arpa_str(addr),
                       {qtype = self.TYPE_PTR})
 end
-
-
-randomseed(ngx_time())
 
 
 return _M

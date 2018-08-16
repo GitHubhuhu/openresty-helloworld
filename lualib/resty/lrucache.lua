@@ -12,6 +12,22 @@ local setmetatable = setmetatable
 local tonumber = tonumber
 
 
+if string.find(jit.version, " 2.0", 1, true) then
+    ngx.log(ngx.ALERT, "use of lua-resty-lrucache with LuaJIT 2.0 is ",
+                       "not recommended; use LuaJIT 2.1+ instead")
+end
+
+
+local ok, tb_clear = pcall(require, "table.clear")
+if not ok then
+    tb_clear = function (tab)
+        for k, _ in pairs(tab) do
+            tab[k] = nil
+        end
+    end
+end
+
+
 -- queue data types
 --
 -- this queue is a double-ended queue and the first node
@@ -29,7 +45,6 @@ ffi.cdef[[
 ]]
 
 local queue_arr_type = ffi.typeof("lrucache_queue_t[?]")
-local queue_ptr_type = ffi.typeof("lrucache_queue_t*")
 local queue_type = ffi.typeof("lrucache_queue_t")
 local NULL = ffi.null
 
@@ -59,7 +74,7 @@ local function queue_init(size)
     else
         local prev = q[0]
         for i = 1, size do
-          local e = q[i]
+          local e = q + i
           prev.next = e
           e.prev = prev
           prev = e
@@ -114,7 +129,7 @@ end
 -- true module stuffs
 
 local _M = {
-    _VERSION = '0.04'
+    _VERSION = '0.08'
 }
 local mt = { __index = _M }
 
@@ -130,7 +145,6 @@ function _M.new(size)
     end
 
     local self = {
-        keys = {},
         hasht = {},
         free_queue = queue_init(size),
         cache_queue = queue_init(),
@@ -144,7 +158,7 @@ end
 function _M.get(self, key)
     local hasht = self.hasht
     local val = hasht[key]
-    if not val then
+    if val == nil then
         return nil
     end
 
@@ -222,6 +236,35 @@ function _M.set(self, key, value, ttl)
         node.expire = ngx_now() + ttl
     else
         node.expire = -1
+    end
+end
+
+
+function _M.flush_all(self)
+    tb_clear(self.hasht)
+    tb_clear(self.node2key)
+    tb_clear(self.key2node)
+
+    local cache_queue = self.cache_queue
+    local free_queue = self.free_queue
+
+    -- splice the cache_queue into free_queue
+    if not queue_is_empty(cache_queue) then
+        local free_head = free_queue[0]
+        local free_last = free_head.prev
+
+        local cache_head = cache_queue[0]
+        local cache_first = cache_head.next
+        local cache_last = cache_head.prev
+
+        free_last.next = cache_first
+        cache_first.prev = free_last
+
+        cache_last.next = free_head
+        free_head.prev = cache_last
+
+        cache_head.next = cache_queue
+        cache_head.prev = cache_queue
     end
 end
 

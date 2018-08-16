@@ -1,4 +1,4 @@
--- Copyright (C) Yichun Zhang (agentzh), CloudFlare Inc.
+-- Copyright (C) Yichun Zhang (agentzh)
 
 
 local sub = string.sub
@@ -11,6 +11,7 @@ local unpack = unpack
 local setmetatable = setmetatable
 local tonumber = tonumber
 local tostring = tostring
+local rawget = rawget
 --local error = error
 
 
@@ -20,67 +21,24 @@ if not ok or type(new_tab) ~= "function" then
 end
 
 
-local _M = new_tab(0, 155)
-_M._VERSION = '0.20'
+local _M = new_tab(0, 54)
+
+_M._VERSION = '0.26'
 
 
-local commands = {
-    "append",            "auth",              "bgrewriteaof",
-    "bgsave",            "bitcount",          "bitop",
-    "blpop",             "brpop",
-    "brpoplpush",        "client",            "config",
-    "dbsize",
-    "debug",             "decr",              "decrby",
-    "del",               "discard",           "dump",
-    "echo",
-    "eval",              "exec",              "exists",
-    "expire",            "expireat",          "flushall",
-    "flushdb",           "get",               "getbit",
-    "getrange",          "getset",            "hdel",
-    "hexists",           "hget",              "hgetall",
-    "hincrby",           "hincrbyfloat",      "hkeys",
-    "hlen",
-    "hmget",             --[[ "hmset", ]]     "hscan",
-    "hset",
-    "hsetnx",            "hvals",             "incr",
-    "incrby",            "incrbyfloat",       "info",
-    "keys",
-    "lastsave",          "lindex",            "linsert",
-    "llen",              "lpop",              "lpush",
-    "lpushx",            "lrange",            "lrem",
-    "lset",              "ltrim",             "mget",
-    "migrate",
-    "monitor",           "move",              "mset",
-    "msetnx",            "multi",             "object",
-    "persist",           "pexpire",           "pexpireat",
-    "ping",              "psetex",       --[[ "psubscribe", ]]
-    "pttl",
-    "publish",      --[[ "punsubscribe", ]]   "pubsub",
-    "quit",
-    "randomkey",         "rename",            "renamenx",
-    "restore",
-    "rpop",              "rpoplpush",         "rpush",
-    "rpushx",            "sadd",              "save",
-    "scan",              "scard",             "script",
-    "sdiff",             "sdiffstore",
-    "select",            "set",               "setbit",
-    "setex",             "setnx",             "setrange",
-    "shutdown",          "sinter",            "sinterstore",
-    "sismember",         "slaveof",           "slowlog",
-    "smembers",          "smove",             "sort",
-    "spop",              "srandmember",       "srem",
-    "sscan",
-    "strlen",       --[[ "subscribe", ]]      "sunion",
-    "sunionstore",       "sync",              "time",
-    "ttl",
-    "type",         --[[ "unsubscribe", ]]    "unwatch",
-    "watch",             "zadd",              "zcard",
-    "zcount",            "zincrby",           "zinterstore",
-    "zrange",            "zrangebyscore",     "zrank",
-    "zrem",              "zremrangebyrank",   "zremrangebyscore",
-    "zrevrange",         "zrevrangebyscore",  "zrevrank",
-    "zscan",
-    "zscore",            "zunionstore",       "evalsha"
+local common_cmds = {
+    "get",      "set",          "mget",     "mset",
+    "del",      "incr",         "decr",                 -- Strings
+    "llen",     "lindex",       "lpop",     "lpush",
+    "lrange",   "linsert",                              -- Lists
+    "hexists",  "hget",         "hset",     "hmget",
+    --[[ "hmset", ]]            "hdel",                 -- Hashes
+    "smembers", "sismember",    "sadd",     "srem",
+    "sdiff",    "sinter",       "sunion",               -- Sets
+    "zrange",   "zrangebyscore", "zrank",   "zadd",
+    "zrem",     "zincrby",                              -- Sorted Sets
+    "auth",     "eval",         "expire",   "script",
+    "sort"                                              -- Others
 }
 
 
@@ -102,12 +60,12 @@ function _M.new(self)
     if not sock then
         return nil, err
     end
-    return setmetatable({ sock = sock }, mt)
+    return setmetatable({ _sock = sock, _subscribed = false }, mt)
 end
 
 
 function _M.set_timeout(self, timeout)
-    local sock = self.sock
+    local sock = rawget(self, "_sock")
     if not sock then
         return nil, "not initialized"
     end
@@ -117,24 +75,24 @@ end
 
 
 function _M.connect(self, ...)
-    local sock = self.sock
+    local sock = rawget(self, "_sock")
     if not sock then
         return nil, "not initialized"
     end
 
-    self.subscribed = nil
+    self._subscribed = false
 
     return sock:connect(...)
 end
 
 
 function _M.set_keepalive(self, ...)
-    local sock = self.sock
+    local sock = rawget(self, "_sock")
     if not sock then
         return nil, "not initialized"
     end
 
-    if self.subscribed then
+    if rawget(self, "_subscribed") then
         return nil, "subscribed state"
     end
 
@@ -143,7 +101,7 @@ end
 
 
 function _M.get_reused_times(self)
-    local sock = self.sock
+    local sock = rawget(self, "_sock")
     if not sock then
         return nil, "not initialized"
     end
@@ -153,7 +111,7 @@ end
 
 
 local function close(self)
-    local sock = self.sock
+    local sock = rawget(self, "_sock")
     if not sock then
         return nil, "not initialized"
     end
@@ -166,7 +124,7 @@ _M.close = close
 local function _read_reply(self, sock)
     local line, err = sock:receive()
     if not line then
-        if err == "timeout" and not self.subscribed then
+        if err == "timeout" and not rawget(self, "_subscribed") then
             sock:close()
         end
         return nil, err
@@ -210,7 +168,7 @@ local function _read_reply(self, sock)
             return null
         end
 
-        local vals = new_tab(n, 0);
+        local vals = new_tab(n, 0)
         local nvals = 0
         for i = 1, n do
             local res, err = _read_reply(self, sock)
@@ -240,7 +198,8 @@ local function _read_reply(self, sock)
         return false, sub(line, 2)
 
     else
-        return nil, "unkown prefix: \"" .. prefix .. "\""
+        -- when `line` is an empty string, `prefix` will be equal to nil.
+        return nil, "unkown prefix: \"" .. tostring(prefix) .. "\""
     end
 end
 
@@ -248,23 +207,23 @@ end
 local function _gen_req(args)
     local nargs = #args
 
-    local req = new_tab(nargs + 1, 0)
+    local req = new_tab(nargs * 5 + 1, 0)
     req[1] = "*" .. nargs .. "\r\n"
-    local nbits = 1
+    local nbits = 2
 
     for i = 1, nargs do
         local arg = args[i]
-        nbits = nbits + 1
-
-        if not arg then
-            req[nbits] = "$-1\r\n"
-
-        else
-            if type(arg) ~= "string" then
-                arg = tostring(arg)
-            end
-            req[nbits] = "$" .. #arg .. "\r\n" .. arg .. "\r\n"
+        if type(arg) ~= "string" then
+            arg = tostring(arg)
         end
+
+        req[nbits] = "$"
+        req[nbits + 1] = #arg
+        req[nbits + 2] = "\r\n"
+        req[nbits + 3] = arg
+        req[nbits + 4] = "\r\n"
+
+        nbits = nbits + 5
     end
 
     -- it is much faster to do string concatenation on the C land
@@ -276,14 +235,14 @@ end
 local function _do_cmd(self, ...)
     local args = {...}
 
-    local sock = self.sock
+    local sock = rawget(self, "_sock")
     if not sock then
         return nil, "not initialized"
     end
 
     local req = _gen_req(args)
 
-    local reqs = self._reqs
+    local reqs = rawget(self, "_reqs")
     if reqs then
         reqs[#reqs + 1] = req
         return
@@ -305,18 +264,18 @@ local function _check_subscribed(self, res)
        and (res[1] == "unsubscribe" or res[1] == "punsubscribe")
        and res[3] == 0
    then
-        self.subscribed = nil
+        self._subscribed = false
     end
 end
 
 
 function _M.read_reply(self)
-    local sock = self.sock
+    local sock = rawget(self, "_sock")
     if not sock then
         return nil, "not initialized"
     end
 
-    if not self.subscribed then
+    if not rawget(self, "_subscribed") then
         return nil, "not subscribed"
     end
 
@@ -327,8 +286,8 @@ function _M.read_reply(self)
 end
 
 
-for i = 1, #commands do
-    local cmd = commands[i]
+for i = 1, #common_cmds do
+    local cmd = common_cmds[i]
 
     _M[cmd] =
         function (self, ...)
@@ -342,7 +301,7 @@ for i = 1, #sub_commands do
 
     _M[cmd] =
         function (self, ...)
-            self.subscribed = true
+            self._subscribed = true
             return _do_cmd(self, cmd, ...)
         end
 end
@@ -361,9 +320,8 @@ end
 
 
 function _M.hmset(self, hashname, ...)
-    local args = {...}
-    if #args == 1 then
-        local t = args[1]
+    if select('#', ...) == 1 then
+        local t = select(1, ...)
 
         local n = 0
         for k, v in pairs(t) do
@@ -398,14 +356,14 @@ end
 
 
 function _M.commit_pipeline(self)
-    local reqs = self._reqs
+    local reqs = rawget(self, "_reqs")
     if not reqs then
         return nil, "no pipeline"
     end
 
     self._reqs = nil
 
-    local sock = self.sock
+    local sock = rawget(self, "_sock")
     if not sock then
         return nil, "not initialized"
     end
@@ -452,6 +410,7 @@ function _M.array_to_hash(self, t)
 end
 
 
+-- this method is deperate since we already do lazy method generation.
 function _M.add_commands(...)
     local cmds = {...}
     for i = 1, #cmds do
@@ -462,6 +421,19 @@ function _M.add_commands(...)
             end
     end
 end
+
+
+setmetatable(_M, {__index = function(self, cmd)
+    local method =
+        function (self, ...)
+            return _do_cmd(self, cmd, ...)
+        end
+
+    -- cache the lazily generated method in our
+    -- module table
+    _M[cmd] = method
+    return method
+end})
 
 
 return _M

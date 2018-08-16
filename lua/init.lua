@@ -1,7 +1,7 @@
 local cjson = require "cjson";
 local configCache = ngx.shared.config_cache;
 
-local resourcesFile =  io.open("/export/App/nginx-app/config/resources.properties", "r");
+local resourcesFile =  io.open("/srv/share/github/openresty-helloworld/config/resources.properties", "r");
 local resourcesStr = resourcesFile:read("*a");
 resourcesFile:close();
 
